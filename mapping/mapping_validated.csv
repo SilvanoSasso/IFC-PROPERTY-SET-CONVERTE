@@ -1,0 +1,4 @@
+PSet,IFCName,IsActive,Group,CivilSource
+PSet_Profile,ProfileGrade,TRUE,Property,Profile Grade
+PSet_RoadAlignment,ChordLength,TRUE,Property,Chord Length
+PSet_RoadAlignment,HorizontalAlignment,TRUE,Property,Horizontal Alignment
