@@ -1,0 +1,60 @@
+name: Validate mapping
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Generate mapping files
+        run: python src/generate_mapping.py
+
+      - name: Lint Python sources
+        run: python -m compileall src
+
+      - name: Validate JSON and CSV outputs
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+
+          json_files = [
+              Path('mapping/mapping_validated.json'),
+              Path('mapping/IfcInfraExportMapping.json'),
+              Path('mapping/IfcInfraConfiguration.json'),
+              Path('IfcInfraExportConfiguration/IfcInfraExportPropertyMapping.json'),
+              Path('IfcInfraExportConfiguration/IfcInfraExportMapping.json'),
+              Path('IfcInfraExportConfiguration/IfcInfraConfiguration.json'),
+          ]
+          for file in json_files:
+              with file.open('r', encoding='utf-8') as fh:
+                  json.load(fh)
+
+          csv_files = [
+              Path('mapping/mapping_validated.csv'),
+              Path('IfcInfraExportConfiguration/IfcInfraExportPropertyMapping.csv'),
+          ]
+          for file in csv_files:
+              with file.open('r', encoding='utf-8') as fh:
+                  reader = csv.DictReader(fh)
+                  list(reader)
+          PY
+
+      - name: Ensure repository is clean
+        run: git diff --exit-code
