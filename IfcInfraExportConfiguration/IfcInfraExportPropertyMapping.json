@@ -1,0 +1,102 @@
+# IFC-PROPERTY-SET-CONVERTE
+# Civil 3D IFC Mapper
+
+Questo progetto genera automaticamente i file di configurazione IFC per Autodesk Civil 3D partendo da un file Excel sorgente.
+
+## Struttura del repository
+
+```
+civil3d-ifc-mapper/
+├── mapping/
+│   ├── mapping_source.xlsx              # file sorgente modificabile manualmente
+│   ├── mapping_validated.json           # output JSON generato dallo script
+│   ├── mapping_validated.csv            # output CSV generato dallo script
+│   ├── IfcInfraExportMapping.json       # output opzionale
+│   └── IfcInfraConfiguration.json       # output opzionale
+├── src/
+│   └── generate_mapping.py              # script principale Python
+├── IfcInfraExportConfiguration/
+│   ├── IfcInfraExportPropertyMapping.json
+│   ├── IfcInfraExportPropertyMapping.csv
+│   ├── IfcInfraExportMapping.json
+│   └── IfcInfraConfiguration.json
+├── .github/
+│   └── workflows/
+│       └── validate.yml                 # GitHub Action di validazione
+├── README.md
+└── requirements.txt
+```
+
+## Prerequisiti
+
+- Python 3.10 o superiore
+- Dipendenze Python indicate in `requirements.txt` (`pandas`, `openpyxl`)
+
+Per installare le dipendenze:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+## Preparare `mapping_source.xlsx`
+
+`mapping/mapping_source.xlsx` è l'unico file da modificare manualmente. Ogni riga descrive una proprietà da esportare:
+
+| Colonna        | Descrizione                                                                 |
+| -------------- | ---------------------------------------------------------------------------- |
+| `PSet`         | Nome del Property Set IFC                                                   |
+| `Nome_IFC`     | Nome della proprietà IFC da generare                                        |
+| `Nome_Civil`   | Nome della proprietà in Civil 3D                                            |
+| `Tipo_IFC`     | Tipo dati IFC (es. `IfcLabel`, `IfcLengthMeasure`)                          |
+| `Entita_IFC`   | Elenco di entità IFC applicabili (separate da virgola o punto e virgola)    |
+
+Lo script corregge automaticamente alcuni errori comuni (es. `CordhLength` → `ChordLength`) e valida i tipi IFC ammessi.
+
+## Esecuzione dello script
+
+Per generare i file di mapping:
+
+```bash
+python src/generate_mapping.py
+```
+
+Sono disponibili diverse opzioni della CLI:
+
+```bash
+python src/generate_mapping.py \
+  --sheet "Nome del foglio" \
+  --skip-optional \
+  --output path/personalizzato \
+  --config-dir configurazione/di/produzione
+```
+
+- `--sheet` consente di specificare un foglio Excel diverso dal primo.
+- `--skip-optional` evita la creazione dei file Civil 3D opzionali se non necessari.
+- `--output` e `--config-dir` permettono di personalizzare le cartelle di destinazione.
+
+Lo script produce:
+
+- `mapping/mapping_validated.json`
+- `mapping/mapping_validated.csv`
+- `mapping/IfcInfraExportMapping.json`
+- `mapping/IfcInfraConfiguration.json`
+
+Gli stessi file vengono duplicati in `IfcInfraExportConfiguration/` per l'uso diretto in Civil 3D.
+
+Per eseguire solo la validazione del file Excel senza sovrascrivere gli output esistenti:
+
+```bash
+python src/generate_mapping.py --validate-only
+```
+
+In modalità di validazione è possibile combinare anche l'opzione `--sheet` per indicare il foglio da controllare.
+
+## Automazione CI
+
+La GitHub Action `validate.yml` verifica che:
+
+1. Il codice Python sia sintatticamente valido (`python -m compileall src`).
+2. I file JSON e CSV generati siano coerenti con `mapping_source.xlsx` (eseguendo lo script).
+3. Non ci siano differenze non committate dopo l'esecuzione dello script (`git diff --exit-code`).
+
+Questo garantisce che ogni modifica al file Excel sia accompagnata dagli output aggiornati.
