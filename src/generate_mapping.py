@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
+import logging
+import shutil
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Iterable, List, Mapping, MutableMapping, Sequence
 
 try:
     import pandas as pd
@@ -28,41 +28,34 @@ except ImportError as exc:  # pragma: no cover - dependency guard for runtime cl
 
 REQUIRED_COLUMNS: Sequence[str] = (
     "PSet",
-    "Nome_IFC",
-    "Nome_Civil",
-    "Tipo_IFC",
-    "Entita_IFC",
+    "Name",
+    "Source",
+    "Type",
+    "Entities",
 )
 
 COLUMN_ALIASES: Mapping[str, str] = {
-    "Entità_IFC": "Entita_IFC",
-    "Entity_IFC": "Entita_IFC",
-    "Civil_Name": "Nome_Civil",
-    "IFC_Name": "Nome_IFC",
+    "Nome_IFC": "Name",
+    "Parametro IFC": "Name",
+    "IFC": "Name",
+    "Nome_Civil": "Source",
+    "Parametro Civil": "Source",
+    "Parametro Civil 3D": "Source",
+    "Tipo_IFC": "Type",
+    "Tipo IFC": "Type",
+    "Entita_IFC": "Entities",
+    "Entità_IFC": "Entities",
+    "Entità IFC": "Entities",
 }
 
 NAME_CORRECTIONS: Mapping[str, str] = {
     "CordhLength": "ChordLength",
+    "Insulation Type": "InsulationType",
 }
 
-ALLOWED_TYPES = {
-    "IfcBoolean",
-    "IfcIdentifier",
-    "IfcInteger",
-    "IfcLabel",
-    "IfcLengthMeasure",
-    "IfcLogical",
-    "IfcPositiveLengthMeasure",
-    "IfcRatioMeasure",
-    "IfcReal",
-    "IfcText",
-}
-
-CSV_HEADER = ("PSet", "IFCName", "IsActive", "Group", "CivilSource")
-
-DEFAULT_SOURCE = "Civil 3D"
-DEFAULT_SOURCE_REFERENCE = "UserDefined"
-ENTITY_SPLIT_PATTERN = re.compile(r"[;,\n]+")
+CSV_HEADER = ("PSet", "Name", "Attivo", "Gruppo", "Source")
+DEFAULT_PRIMARY_TYPE = "IfcLabel"
+ENTITY_SEPARATORS = (";", ",", "\n")
 
 
 @dataclass(frozen=True)
@@ -70,9 +63,9 @@ class MappingRecord:
     """Normalised row extracted from the Excel workbook."""
 
     pset: str
-    ifc_name: str
-    civil_name: str
-    ifc_type: str
+    name: str
+    source: str
+    type: str
     entities: tuple[str, ...]
 
     @classmethod
@@ -80,57 +73,51 @@ class MappingRecord:
         normalised: MutableMapping[str, str] = {}
         for column in REQUIRED_COLUMNS:
             value = record.get(column, "")
-            if value is None:
-                text_value = ""
-            else:
-                text_value = str(value).strip()
+            text_value = "" if value is None else str(value).strip()
             normalised[column] = text_value
 
         if not normalised["PSet"]:
             raise ValueError("PSet column contains empty value.")
 
-        if not normalised["Nome_IFC"]:
-            raise ValueError(f"Nome_IFC is required for PSet '{normalised['PSet']}'.")
+        name = NAME_CORRECTIONS.get(normalised["Name"], normalised["Name"])
+        source = NAME_CORRECTIONS.get(normalised["Source"], normalised["Source"])
+        type_name = normalised["Type"] or DEFAULT_PRIMARY_TYPE
 
-        if not normalised["Nome_Civil"]:
-            raise ValueError(
-                f"Nome_Civil is required for IFC property '{normalised['Nome_IFC']}' in PSet '{normalised['PSet']}'."
-            )
+        if not name:
+            raise ValueError(f"Missing IFC property name for PSet '{normalised['PSet']}'.")
 
-        corrected_name = NAME_CORRECTIONS.get(normalised["Nome_IFC"], normalised["Nome_IFC"])
-        normalised["Nome_IFC"] = corrected_name
+        if not source:
+            raise ValueError(f"Missing Civil 3D source for property '{name}' in PSet '{normalised['PSet']}'.")
 
-        if normalised["Tipo_IFC"] not in ALLOWED_TYPES:
-            raise ValueError(
-                f"Tipo_IFC '{normalised['Tipo_IFC']}' is not an allowed IFC measure type for property '{corrected_name}'."
-            )
+        if not type_name:
+            raise ValueError(f"Missing IFC type for property '{name}' in PSet '{normalised['PSet']}'.")
 
-        entities_text = normalised["Entita_IFC"]
+        entities_text = normalised["Entities"].replace("/", ";")
         if not entities_text:
             raise ValueError(
-                f"Entita_IFC must contain at least one entity for property '{corrected_name}' in PSet '{normalised['PSet']}'."
+                f"Missing IFC entities for property '{name}' in PSet '{normalised['PSet']}'."
             )
 
-        entities = tuple(
-            entity.strip()
-            for entity in ENTITY_SPLIT_PATTERN.split(entities_text.replace("/", ","))
-            if entity.strip()
-        )
+        normalised_text = entities_text
+        for separator in ENTITY_SEPARATORS[1:]:
+            normalised_text = normalised_text.replace(separator, ENTITY_SEPARATORS[0])
+
+        entities = tuple(part.strip() for part in normalised_text.split(ENTITY_SEPARATORS[0]) if part.strip())
         if not entities:
             raise ValueError(
-                f"Entita_IFC must contain at least one entity for property '{corrected_name}' in PSet '{normalised['PSet']}'."
+                f"Missing IFC entities for property '{name}' in PSet '{normalised['PSet']}'."
             )
 
         return cls(
             pset=normalised["PSet"],
-            ifc_name=corrected_name,
-            civil_name=normalised["Nome_Civil"],
-            ifc_type=normalised["Tipo_IFC"],
+            name=name,
+            source=source,
+            type=type_name,
             entities=entities,
         )
 
 
-def load_source(path: Path, sheet: str | None = None) -> List[MappingRecord]:
+def load_source(path: Path, *, sheet: str | None = None) -> List[MappingRecord]:
     if not path.exists():
         raise FileNotFoundError(path)
 
@@ -139,166 +126,146 @@ def load_source(path: Path, sheet: str | None = None) -> List[MappingRecord]:
     except Exception as exc:  # pragma: no cover - conversion of pandas errors to runtime errors
         raise RuntimeError(f"Failed to read Excel workbook '{path}': {exc}") from exc
 
-    frame = frame.rename(columns={alias: target for alias, target in COLUMN_ALIASES.items() if alias in frame.columns})
+    rename_map = {alias: target for alias, target in COLUMN_ALIASES.items() if alias in frame.columns}
+    if rename_map:
+        frame = frame.rename(columns=rename_map)
+
     missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
     if missing:
-        raise ValueError(
-            "Missing required columns in Excel source: " + ", ".join(missing)
-        )
+        raise ValueError("Missing required columns in Excel source: " + ", ".join(missing))
 
     frame = frame.fillna("")
 
     records: List[MappingRecord] = []
     seen_pairs: set[tuple[str, str]] = set()
-    seen_civil: set[tuple[str, str]] = set()
-    for raw in frame.to_dict(orient="records"):
-        record = MappingRecord.from_raw(raw)
-        key = (record.pset, record.ifc_name)
+    seen_sources: set[tuple[str, str]] = set()
+
+    for row in frame.to_dict(orient="records"):
+        if all(not str(value).strip() for value in row.values()):
+            continue
+
+        record = MappingRecord.from_raw(row)
+
+        key = (record.pset, record.name.lower())
         if key in seen_pairs:
-            raise ValueError(f"Duplicate IFC property '{record.ifc_name}' detected for PSet '{record.pset}'.")
+            raise ValueError(f"Duplicate IFC property '{record.name}' detected for PSet '{record.pset}'.")
         seen_pairs.add(key)
 
-        civil_key = (record.pset, record.civil_name.lower())
-        if civil_key in seen_civil:
+        source_key = (record.pset, record.source.lower())
+        if source_key in seen_sources:
             raise ValueError(
-                f"Duplicate Civil 3D property name '{record.civil_name}' detected for PSet '{record.pset}'."
+                f"Duplicate Civil 3D source '{record.source}' detected for PSet '{record.pset}'."
             )
-        seen_civil.add(civil_key)
+        seen_sources.add(source_key)
 
         records.append(record)
+
+    if not records:
+        raise ValueError("Excel source does not contain any valid mapping rows.")
 
     return records
 
 
 def build_property_sets(records: Sequence[MappingRecord]):
-    csv_rows: List[Dict[str, str]] = []
-    grouped_entities: Dict[str, set[str]] = defaultdict(set)
-    grouped_records: Dict[str, List[MappingRecord]] = defaultdict(list)
-
+    grouped: dict[str, list[MappingRecord]] = {}
     for record in records:
-        grouped_records[record.pset].append(record)
-        grouped_entities[record.pset].update(record.entities)
+        grouped.setdefault(record.pset, []).append(record)
 
-    property_sets: List[Dict[str, object]] = []
-    for pset in sorted(grouped_records):
-        payload = []
-        for record in sorted(grouped_records[pset], key=lambda item: item.ifc_name):
-            payload.append(
-                {
-                    "Name": record.ifc_name,
-                    "CivilName": record.civil_name,
-                    "IFCType": record.ifc_type,
-                    "Source": DEFAULT_SOURCE_REFERENCE,
-                    "IsExported": True,
-                }
-            )
-            csv_rows.append(
-                {
-                    "PSet": pset,
-                    "IFCName": record.ifc_name,
-                    "IsActive": "TRUE",
-                    "Group": "Property",
-                    "CivilSource": record.civil_name,
-                }
-            )
+    property_sets: list[dict[str, object]] = []
+    csv_rows: list[dict[str, str]] = []
+
+    for pset in sorted(grouped):
+        mappings = sorted(grouped[pset], key=lambda item: item.name.lower())
+        entities = sorted({entity for record in mappings for entity in record.entities})
+
+        property_templates = [
+            {
+                "Name": record.name,
+                "Description": "",
+                "PrimaryMeasureType": record.type,
+                "Source": record.source,
+            }
+            for record in mappings
+        ]
+
+        csv_rows.extend(
+            {
+                "PSet": pset,
+                "Name": record.name,
+                "Attivo": "TRUE",
+                "Gruppo": pset,
+                "Source": record.source,
+            }
+            for record in mappings
+        )
 
         property_sets.append(
             {
                 "Name": pset,
-                "Source": DEFAULT_SOURCE,
-                "PrimaryMeasureType": "IfcPropertySet",
-                "ApplicableEntities": sorted(grouped_entities[pset]),
-                "Properties": payload,
+                "ApplicableEntities": ";".join(entities),
+                "TemplateType": "NOTDEFINED",
+                "PropertyTemplates": property_templates,
             }
         )
 
     return property_sets, csv_rows
 
 
-def write_json(data: Dict[str, object], path: Path) -> None:
+def write_json(data: Mapping[str, object] | list[object], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+    logging.info("Wrote JSON file: %s", path)
 
 
-def write_csv(rows: Iterable[Dict[str, str]], path: Path) -> None:
+def write_csv(rows: Iterable[Mapping[str, str]], path: Path) -> None:
     materialised = list(rows)
     if not materialised:
-        return
+        raise ValueError("No rows available to write CSV output.")
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_HEADER)
         writer.writeheader()
         for row in materialised:
             writer.writerow(row)
+    logging.info("Wrote CSV file: %s", path)
 
 
-def generate_mapping(
+def write_mapping_files(
     source_path: Path,
     output_dir: Path,
     config_dir: Path,
     *,
-    sheet: str | None = None,
-    include_optional: bool = True,
-) -> Dict[str, Path]:
-    records = load_source(source_path, sheet=sheet)
-    property_sets, csv_rows = build_property_sets(records)
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    mapping_document = {
-        "Metadata": {
-            "GeneratedOn": timestamp,
-            "Source": source_path.name,
-            "RecordCount": len(records),
-        },
+    property_sets: Sequence[Mapping[str, object]],
+    csv_rows: Sequence[Mapping[str, str]],
+) -> dict[str, Path]:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=timezone.utc).isoformat()
+    json_payload = {
+        "GeneratedOn": timestamp,
+        "Source": source_path.name,
         "PropertySetTemplates": property_sets,
     }
 
     json_output = output_dir / "mapping_validated.json"
     csv_output = output_dir / "mapping_validated.csv"
 
-    write_json(mapping_document, json_output)
+    write_json(json_payload, json_output)
     write_csv(csv_rows, csv_output)
 
-    produced: Dict[str, Path] = {
-        "IfcInfraExportPropertyMapping.json": json_output,
-        "IfcInfraExportPropertyMapping.csv": csv_output,
+    produced = {
+        "mapping_validated.json": json_output,
+        "mapping_validated.csv": csv_output,
     }
-
-    if include_optional:
-        mapping_summary = {
-            "MappingVersion": "1.0",
-            "GeneratedOn": timestamp,
-            "PropertySetFile": "IfcInfraExportPropertyMapping.json",
-        }
-        configuration = {
-            "Export": {
-                "IncludePropertySets": True,
-                "PropertyMapping": "IfcInfraExportPropertyMapping.json",
-                "GeneratedOn": timestamp,
-            }
-        }
-
-        optional_mapping_path = output_dir / "IfcInfraExportMapping.json"
-        optional_configuration_path = output_dir / "IfcInfraConfiguration.json"
-
-        write_json(mapping_summary, optional_mapping_path)
-        write_json(configuration, optional_configuration_path)
-
-        produced.update(
-            {
-                "IfcInfraExportMapping.json": optional_mapping_path,
-                "IfcInfraConfiguration.json": optional_configuration_path,
-            }
-        )
 
     config_dir.mkdir(parents=True, exist_ok=True)
     for filename, source in produced.items():
         target = config_dir / filename
         if source.resolve() == target.resolve():
             continue
-        target.write_bytes(source.read_bytes())
+        shutil.copy2(source, target)
+        logging.info("Copied %s -> %s", source, target)
 
     return produced
 
@@ -328,11 +295,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Optional Excel sheet name to read from. Defaults to the first sheet when omitted.",
     )
     parser.add_argument(
-        "--skip-optional",
-        action="store_true",
-        help="Do not generate IfcInfraExportMapping.json and IfcInfraConfiguration.json.",
-    )
-    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate the Excel source without writing any output files.",
@@ -341,20 +303,29 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def main(argv: List[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     args = parse_args(argv or sys.argv[1:])
     records = load_source(args.source, sheet=args.sheet)
+    property_sets, csv_rows = build_property_sets(records)
 
     if args.validate_only:
+        logging.info(
+            "Validation succeeded for %s records from %s.",
+            len(records),
+            args.source,
+        )
         print(f"Validated {len(records)} records from {args.source}.")
         return 0
 
-    generate_mapping(
+    write_mapping_files(
         args.source,
         args.output,
         args.config_dir,
-        sheet=args.sheet,
-        include_optional=not args.skip_optional,
+        property_sets=property_sets,
+        csv_rows=csv_rows,
     )
+    logging.info("Generated mapping files for %s records.", len(records))
     print(f"Generated mapping files for {len(records)} records.")
     return 0
 
